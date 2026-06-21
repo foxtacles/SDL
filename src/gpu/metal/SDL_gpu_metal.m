@@ -454,8 +454,8 @@ typedef struct MetalTextureContainer
 
 typedef struct MetalFence
 {
-    // can be NULL if the command buffer was recycled
-    MetalCommandBuffer *commandBuffer;
+    // retained committed command buffer; nil once the work has completed and the fence is released
+    id<MTLCommandBuffer> handle;
     SDL_AtomicInt referenceCount;
 } MetalFence;
 
@@ -2135,9 +2135,10 @@ static bool METAL_INTERNAL_AcquireFence(
 
     SDL_UnlockMutex(renderer->fenceLock);
 
-    // Associate the fence with the command buffer
+    // Associate the fence with the command buffer. Retain the handle on the fence itself so
+    // completion can still be queried after METAL_Submit nils the command buffer's own handle.
     commandBuffer->fence = fence;
-    fence->commandBuffer = commandBuffer;
+    fence->handle = commandBuffer->handle;
     (void)SDL_AtomicIncRef(&commandBuffer->fence->referenceCount);
 
     return true;
@@ -2164,6 +2165,7 @@ static SDL_GPUCommandBuffer *METAL_AcquireCommandBuffer(
         }
 
         commandBuffer->autoReleaseFence = true;
+        commandBuffer->fence = NULL;
 
         SDL_UnlockMutex(renderer->acquireCommandBufferLock);
 
@@ -3387,6 +3389,9 @@ static void METAL_INTERNAL_ReleaseFenceToPool(
     MetalRenderer *renderer,
     MetalFence *fence)
 {
+    // Drop any remaining reference to the (completed) command buffer before the fence is reused
+    fence->handle = nil;
+
     SDL_LockMutex(renderer->fenceLock);
 
     // FIXME: Should this use EXPAND_IF_NEEDED?
@@ -3518,8 +3523,11 @@ static void METAL_INTERNAL_CleanCommandBuffer(
         METAL_ReleaseFence(
             (SDL_GPURenderer *)renderer,
             (SDL_GPUFence *)commandBuffer->fence);
-    } else {
-        commandBuffer->fence->commandBuffer = NULL;
+    } else if (commandBuffer->fence) {
+        // Work is done; drop the fence's reference to the command buffer. The fence object
+        // stays alive for the user, and IsFenceBusy will now report it as completed.
+        // A command buffer cancelled before submission never acquired a fence.
+        commandBuffer->fence->handle = nil;
     }
 
     // Return command buffer to pool
@@ -3593,12 +3601,12 @@ static void METAL_INTERNAL_PerformPendingDestroys(
 static bool METAL_INTERNAL_IsFenceBusy(
         MetalFence *fence
 ) {
-    if (!fence->commandBuffer) {
-        return false; // command buffer was recycled
+    if (!fence->handle) {
+        return false; // command buffer completed and the handle was released
     }
 
-    MTLCommandBufferStatus status = fence->commandBuffer->handle.status;
-    return status == MTLCommandBufferStatusCommitted || status == MTLCommandBufferStatusScheduled;
+    MTLCommandBufferStatus status = fence->handle.status;
+    return status != MTLCommandBufferStatusCompleted && status != MTLCommandBufferStatusError;
 }
 
 static bool METAL_WaitForFences(
@@ -3614,7 +3622,7 @@ static bool METAL_WaitForFences(
             for (Uint32 i = 0; i < numFences; i += 1) {
                 MetalFence *fence = (MetalFence *)fences[i];
                 if (METAL_INTERNAL_IsFenceBusy(fence)) {
-                    [fence->commandBuffer->handle waitUntilCompleted];
+                    [fence->handle waitUntilCompleted];
                 }
             }
         } else {
@@ -3622,11 +3630,11 @@ static bool METAL_WaitForFences(
             for (Uint32 i = 0; i < numFences; i += 1) {
                 MetalFence *fence = (MetalFence *)fences[i];
                 // command buffer has completed and been recycled
-                if(!fence->commandBuffer)
+                if (!fence->handle)
                     return true;
 
                 // even if it's completed, the handle will call back straight away
-                [fence->commandBuffer->handle addCompletedHandler:^(id<MTLCommandBuffer> buffer) {
+                [fence->handle addCompletedHandler:^(id<MTLCommandBuffer> buffer) {
                     dispatch_semaphore_signal(semaphore);
                 }];
             }
@@ -3645,7 +3653,7 @@ static bool METAL_QueryFence(
     SDL_GPUFence *fence)
 {
     MetalFence *metalFence = (MetalFence *)fence;
-    return METAL_INTERNAL_IsFenceBusy(metalFence);
+    return !METAL_INTERNAL_IsFenceBusy(metalFence);
 }
 
 // Window and Swapchain Management
